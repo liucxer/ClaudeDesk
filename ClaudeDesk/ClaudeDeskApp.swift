@@ -1,32 +1,23 @@
-//
-//  ClaudeDeskApp.swift
-//  ClaudeDesk
-//
-//  Created by Changxi Liu on 2026/6/4.
-//
-
 import SwiftUI
-import SwiftData
 
 @main
 struct ClaudeDeskApp: App {
-    var sharedModelContainer: ModelContainer = {
-        let schema = Schema([
-            Item.self,
-        ])
-        let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
-
-        do {
-            return try ModelContainer(for: schema, configurations: [modelConfiguration])
-        } catch {
-            fatalError("Could not create ModelContainer: \(error)")
-        }
-    }()
+    @StateObject private var store = ProjectStore()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environmentObject(store)
+                .frame(minWidth: 900, minHeight: 600)
         }
-        .modelContainer(sharedModelContainer)
+        .windowToolbarStyle(.unified)
+        .commands {
+            CommandGroup(replacing: .newItem) {
+                Button("New Project…") { store.requestNewProject() }
+                    .keyboardShortcut("n")
+                Button("Open Project…") { store.requestOpenProject() }
+                    .keyboardShortcut("o")
+            }
+        }
     }
 }

@@ -1,59 +1,39 @@
-//
-//  ContentView.swift
-//  ClaudeDesk
-//
-//  Created by Changxi Liu on 2026/6/4.
-//
-
 import SwiftUI
-import SwiftData
 
 struct ContentView: View {
-    @Environment(\.modelContext) private var modelContext
-    @Query private var items: [Item]
+    @EnvironmentObject private var store: ProjectStore
 
     var body: some View {
         NavigationSplitView {
-            List {
-                ForEach(items) { item in
-                    NavigationLink {
-                        Text("Item at \(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))")
-                    } label: {
-                        Text(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))
-                    }
-                }
-                .onDelete(perform: deleteItems)
-            }
-            .navigationSplitViewColumnWidth(min: 180, ideal: 200)
-            .toolbar {
-                ToolbarItem {
-                    Button(action: addItem) {
-                        Label("Add Item", systemImage: "plus")
-                    }
-                }
-            }
+            Sidebar()
+                .navigationSplitViewColumnWidth(min: 200, ideal: 240)
         } detail: {
-            Text("Select an item")
-        }
-    }
-
-    private func addItem() {
-        withAnimation {
-            let newItem = Item(timestamp: Date())
-            modelContext.insert(newItem)
-        }
-    }
-
-    private func deleteItems(offsets: IndexSet) {
-        withAnimation {
-            for index in offsets {
-                modelContext.delete(items[index])
+            if let project = store.selectedProject {
+                ChatView(project: project)
+                    .id(project.id)
+            } else {
+                EmptyProjectPlaceholder()
             }
         }
     }
 }
 
-#Preview {
-    ContentView()
-        .modelContainer(for: Item.self, inMemory: true)
+private struct EmptyProjectPlaceholder: View {
+    @EnvironmentObject private var store: ProjectStore
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "bubble.left.and.bubble.right")
+                .font(.system(size: 48))
+                .foregroundStyle(.tertiary)
+            Text("Select a project, or create a new one.")
+                .foregroundStyle(.secondary)
+            HStack {
+                Button("New Project…") { store.requestNewProject() }
+                Button("Open Existing…") { store.requestOpenProject() }
+            }
+            .controlSize(.large)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
 }
