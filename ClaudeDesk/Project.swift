@@ -5,7 +5,6 @@ struct Project: Codable, Identifiable, Hashable {
     var name: String
     var directoryPath: String
     let createdAt: Date
-    var lastOpenedAt: Date
     var hasStartedSession: Bool
 
     init(
@@ -13,14 +12,12 @@ struct Project: Codable, Identifiable, Hashable {
         name: String,
         directoryPath: String,
         createdAt: Date = Date(),
-        lastOpenedAt: Date = Date(),
         hasStartedSession: Bool = false
     ) {
         self.id = id
         self.name = name
         self.directoryPath = directoryPath
         self.createdAt = createdAt
-        self.lastOpenedAt = lastOpenedAt
         self.hasStartedSession = hasStartedSession
     }
 

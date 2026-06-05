@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import Combine
+import SwiftUI
 
 @MainActor
 final class ProjectStore: ObservableObject {
@@ -9,9 +10,15 @@ final class ProjectStore: ObservableObject {
     @Published var isPresentingNewProjectPrompt: Bool = false
     @Published var lastError: String?
 
-    private let encoder: JSONEncoder = {
+    private let prettyEncoder: JSONEncoder = {
         let e = JSONEncoder()
         e.outputFormatting = [.prettyPrinted, .sortedKeys]
+        e.dateEncodingStrategy = .iso8601
+        return e
+    }()
+    private let lineEncoder: JSONEncoder = {
+        let e = JSONEncoder()
+        e.outputFormatting = [.sortedKeys]
         e.dateEncodingStrategy = .iso8601
         return e
     }()
@@ -45,7 +52,7 @@ final class ProjectStore: ObservableObject {
 
     private func save() {
         do {
-            let data = try encoder.encode(projects)
+            let data = try prettyEncoder.encode(projects)
             try data.write(to: AppPaths.projectsFile, options: .atomic)
         } catch {
             lastError = "Failed to save projects: \(error.localizedDescription)"
@@ -60,9 +67,27 @@ final class ProjectStore: ObservableObject {
         save()
     }
 
-    func touchLastOpened(_ id: UUID) {
-        guard let idx = projects.firstIndex(where: { $0.id == id }) else { return }
-        projects[idx].lastOpenedAt = Date()
+    func move(fromOffsets source: IndexSet, toOffset destination: Int) {
+        projects.move(fromOffsets: source, toOffset: destination)
+        save()
+    }
+
+    func moveUp(_ id: UUID) {
+        guard let idx = projects.firstIndex(where: { $0.id == id }), idx > 0 else { return }
+        projects.swapAt(idx, idx - 1)
+        save()
+    }
+
+    func moveDown(_ id: UUID) {
+        guard let idx = projects.firstIndex(where: { $0.id == id }), idx < projects.count - 1 else { return }
+        projects.swapAt(idx, idx + 1)
+        save()
+    }
+
+    func rename(_ id: UUID, to newName: String) {
+        let name = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, let idx = projects.firstIndex(where: { $0.id == id }) else { return }
+        projects[idx].name = name
         save()
     }
 
@@ -132,20 +157,60 @@ final class ProjectStore: ObservableObject {
 
     func loadTranscript(for projectID: UUID) -> [Message] {
         let url = AppPaths.transcriptFile(for: projectID)
-        guard let data = try? Data(contentsOf: url),
-              let text = String(data: data, encoding: .utf8) else { return [] }
+        guard let data = try? Data(contentsOf: url) else { return [] }
         var result: [Message] = []
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            guard let lineData = line.data(using: .utf8),
-                  let msg = try? decoder.decode(Message.self, from: lineData) else { continue }
-            result.append(msg)
+        for objectData in Self.scanJSONObjects(in: data) {
+            if let msg = try? decoder.decode(Message.self, from: objectData) {
+                result.append(msg)
+            }
         }
         return result
     }
 
+    /// Walks `data` and yields each balanced top-level `{...}` block.
+    /// Tolerates both compact JSONL (one object per line) and legacy pretty-printed concatenated objects.
+    private static func scanJSONObjects(in data: Data) -> [Data] {
+        var out: [Data] = []
+        var depth = 0
+        var inString = false
+        var escape = false
+        var start: Data.Index? = nil
+        for i in data.indices {
+            let b = data[i]
+            if inString {
+                if escape {
+                    escape = false
+                } else if b == 0x5C { // \
+                    escape = true
+                } else if b == 0x22 { // "
+                    inString = false
+                }
+                continue
+            }
+            switch b {
+            case 0x22: // "
+                inString = true
+            case 0x7B: // {
+                if depth == 0 { start = i }
+                depth += 1
+            case 0x7D: // }
+                if depth > 0 {
+                    depth -= 1
+                    if depth == 0, let s = start {
+                        out.append(data.subdata(in: s..<(i + 1)))
+                        start = nil
+                    }
+                }
+            default:
+                break
+            }
+        }
+        return out
+    }
+
     func appendToTranscript(_ message: Message, projectID: UUID) {
         do {
-            let data = try encoder.encode(message)
+            let data = try lineEncoder.encode(message)
             let line = (String(data: data, encoding: .utf8) ?? "") + "\n"
             let url = AppPaths.transcriptFile(for: projectID)
             if FileManager.default.fileExists(atPath: url.path) {

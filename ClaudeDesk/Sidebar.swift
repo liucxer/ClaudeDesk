@@ -4,6 +4,7 @@ import AppKit
 struct Sidebar: View {
     @EnvironmentObject private var store: ProjectStore
     @State private var newProjectName: String = ""
+    @State private var renamingProject: Project?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -13,18 +14,33 @@ struct Sidebar: View {
                         .foregroundStyle(.secondary)
                         .padding(.vertical, 8)
                 } else {
-                    ForEach(sortedProjects) { project in
+                    ForEach(store.projects) { project in
                         SidebarRow(project: project)
                             .tag(project.id)
                             .contextMenu {
+                                Button("Rename…") {
+                                    renamingProject = project
+                                }
                                 Button("Show in Finder") {
                                     NSWorkspace.shared.activateFileViewerSelecting([project.directoryURL])
                                 }
+                                Divider()
+                                Button("Move Up") {
+                                    store.moveUp(project.id)
+                                }
+                                .disabled(store.projects.first?.id == project.id)
+                                Button("Move Down") {
+                                    store.moveDown(project.id)
+                                }
+                                .disabled(store.projects.last?.id == project.id)
                                 Divider()
                                 Button("Remove from List", role: .destructive) {
                                     store.remove(project.id)
                                 }
                             }
+                    }
+                    .onMove { indices, newOffset in
+                        store.move(fromOffsets: indices, toOffset: newOffset)
                     }
                 }
             }
@@ -61,11 +77,16 @@ struct Sidebar: View {
                 store.isPresentingNewProjectPrompt = false
             }
         }
+        .sheet(item: $renamingProject) { project in
+            RenameSheet(initialName: project.name) { newName in
+                store.rename(project.id, to: newName)
+                renamingProject = nil
+            } onCancel: {
+                renamingProject = nil
+            }
+        }
     }
 
-    private var sortedProjects: [Project] {
-        store.projects.sorted { $0.lastOpenedAt > $1.lastOpenedAt }
-    }
 }
 
 private struct SidebarRow: View {
@@ -117,5 +138,43 @@ private struct NewProjectSheet: View {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         onCreate(trimmed)
+    }
+}
+
+private struct RenameSheet: View {
+    @State private var name: String
+    let onSubmit: (String) -> Void
+    let onCancel: () -> Void
+
+    init(initialName: String, onSubmit: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
+        self._name = State(initialValue: initialName)
+        self.onSubmit = onSubmit
+        self.onCancel = onCancel
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Rename Project")
+                .font(.headline)
+            TextField("Project name", text: $name)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(submit)
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                Button("Rename", action: submit)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 360)
+    }
+
+    private func submit() {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        onSubmit(trimmed)
     }
 }

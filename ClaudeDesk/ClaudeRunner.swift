@@ -3,7 +3,8 @@ import Combine
 
 enum StreamEvent {
     case sessionStarted(id: String)
-    case assistantText(String)
+    case assistantTextDelta(String)
+    case assistantMessageEnd
     case toolActivity
     case result(isError: Bool, message: String?)
 }
@@ -34,8 +35,15 @@ final class ClaudeRunner: ObservableObject {
         var args: [String] = [
             "--print",
             "--output-format", "stream-json",
+            "--include-partial-messages",
             "--verbose",
         ]
+        if let mcpJSON = Self.buildMCPConfigJSON() {
+            args.append(contentsOf: [
+                "--mcp-config", mcpJSON,
+                "--permission-prompt-tool", "mcp__claudedesk__permission_prompt",
+            ])
+        }
         if project.hasStartedSession {
             args.append(contentsOf: ["--resume", project.id.uuidString])
         } else {
@@ -109,7 +117,7 @@ final class ClaudeRunner: ObservableObject {
     private func deliver(_ event: StreamEvent, onEvent: (StreamEvent) -> Void) {
         switch event {
         case .toolActivity: toolBusy = true
-        case .assistantText: toolBusy = false
+        case .assistantTextDelta: toolBusy = false
         default: break
         }
         onEvent(event)
@@ -127,17 +135,22 @@ final class ClaudeRunner: ObservableObject {
                 return .sessionStarted(id: sid)
             }
             return nil
-        case "assistant":
-            guard let message = obj["message"] as? [String: Any],
-                  let blocks = message["content"] as? [[String: Any]] else { return nil }
-            var combined = ""
-            for block in blocks {
-                if (block["type"] as? String) == "text",
-                   let text = block["text"] as? String {
-                    combined += text
-                }
+        case "stream_event":
+            guard let event = obj["event"] as? [String: Any],
+                  let eventType = event["type"] as? String else { return nil }
+            switch eventType {
+            case "content_block_delta":
+                guard let delta = event["delta"] as? [String: Any],
+                      (delta["type"] as? String) == "text_delta",
+                      let text = delta["text"] as? String else { return nil }
+                return .assistantTextDelta(text)
+            case "message_stop":
+                return .assistantMessageEnd
+            default:
+                return nil
             }
-            return combined.isEmpty ? nil : .assistantText(combined)
+        case "assistant":
+            return nil
         case "user":
             return .toolActivity
         case "result":
@@ -147,6 +160,21 @@ final class ClaudeRunner: ObservableObject {
         default:
             return nil
         }
+    }
+
+    private static func buildMCPConfigJSON() -> String? {
+        let scriptPath = PermissionGateway.shared.mcpScriptPath
+        let socketPath = PermissionGateway.shared.socketPath
+        let config: [String: Any] = [
+            "mcpServers": [
+                "claudedesk": [
+                    "command": scriptPath,
+                    "args": [socketPath],
+                ] as [String: Any]
+            ]
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: config) else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 
     static func findClaudeBinary() -> URL? {

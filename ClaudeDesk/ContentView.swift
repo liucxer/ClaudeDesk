@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var store: ProjectStore
+    @EnvironmentObject private var gateway: PermissionGateway
 
     var body: some View {
         NavigationSplitView {
@@ -14,6 +15,9 @@ struct ContentView: View {
             } else {
                 EmptyProjectPlaceholder()
             }
+        }
+        .sheet(item: $gateway.pending) { request in
+            PermissionDialog(request: request)
         }
     }
 }

@@ -7,6 +7,7 @@ struct ChatView: View {
     @StateObject private var runner = ClaudeRunner()
     @State private var messages: [Message] = []
     @State private var input: String = ""
+    @State private var streamingMessageID: UUID?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -21,7 +22,7 @@ struct ChatView: View {
                             MessageRow(message: msg)
                                 .id(msg.id)
                         }
-                        if runner.isRunning {
+                        if runner.isRunning && (streamingMessageID == nil || runner.toolBusy) {
                             ThinkingIndicator(toolBusy: runner.toolBusy)
                                 .id("thinking")
                         }
@@ -31,6 +32,11 @@ struct ChatView: View {
                 .onChange(of: messages.count) { _ in
                     if let last = messages.last {
                         withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                    }
+                }
+                .onChange(of: messages.last?.text) { _ in
+                    if let last = messages.last {
+                        proxy.scrollTo(last.id, anchor: .bottom)
                     }
                 }
                 .onChange(of: runner.isRunning) { running in
@@ -47,7 +53,6 @@ struct ChatView: View {
         }
         .onAppear {
             messages = store.loadTranscript(for: project.id)
-            store.touchLastOpened(project.id)
         }
     }
 
@@ -74,15 +79,16 @@ struct ChatView: View {
 
     private var composer: some View {
         HStack(alignment: .bottom, spacing: 8) {
-            TextEditor(text: $input)
-                .font(.body)
-                .frame(minHeight: 60, maxHeight: 160)
-                .padding(6)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6)
-                        .stroke(Color.secondary.opacity(0.3))
-                )
-                .disabled(runner.isRunning)
+            ChatTextEditor(
+                text: $input,
+                isEnabled: !runner.isRunning,
+                onSubmit: send
+            )
+            .frame(minHeight: 60, maxHeight: 160)
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color.secondary.opacity(0.3))
+            )
 
             VStack(spacing: 6) {
                 if runner.isRunning {
@@ -95,10 +101,9 @@ struct ChatView: View {
                         Label("Send", systemImage: "paperplane.fill")
                     }
                     .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.return, modifiers: .command)
                     .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                Text("⌘↩")
+                Text("↩ send · ⇧↩ newline")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -134,13 +139,32 @@ struct ChatView: View {
             switch event {
             case .sessionStarted:
                 store.markSessionStarted(project.id)
-            case .assistantText(let text):
-                let m = Message(role: .assistant, text: text)
-                messages.append(m)
-                store.appendToTranscript(m, projectID: project.id)
+            case .assistantTextDelta(let chunk):
+                if let sid = streamingMessageID,
+                   let idx = messages.firstIndex(where: { $0.id == sid }) {
+                    messages[idx].text += chunk
+                } else {
+                    let m = Message(role: .assistant, text: chunk)
+                    messages.append(m)
+                    streamingMessageID = m.id
+                }
+            case .assistantMessageEnd:
+                if let sid = streamingMessageID,
+                   let final = messages.first(where: { $0.id == sid }) {
+                    store.appendToTranscript(final, projectID: project.id)
+                }
+                streamingMessageID = nil
             case .toolActivity:
                 break
             case .result(let isError, let msg):
+                // If the turn ended without an explicit message_stop (tool error,
+                // process killed, etc.), the in-progress assistant message would
+                // otherwise be visible in the UI but never persisted.
+                if let sid = streamingMessageID,
+                   let final = messages.first(where: { $0.id == sid }) {
+                    store.appendToTranscript(final, projectID: project.id)
+                }
+                streamingMessageID = nil
                 if isError {
                     let detail = msg ?? "claude returned an error."
                     let m = Message(role: .system, text: detail)

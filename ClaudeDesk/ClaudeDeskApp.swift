@@ -8,6 +8,7 @@ struct ClaudeDeskApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(store)
+                .environmentObject(PermissionGateway.shared)
                 .frame(minWidth: 900, minHeight: 600)
         }
         .windowToolbarStyle(.unified)
