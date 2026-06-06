@@ -17,6 +17,16 @@ enum AppPaths {
         return dir
     }()
 
+    static let attachmentsDir: URL = {
+        let dir = baseURL.appendingPathComponent("attachments", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
+
+    static func attachmentURL(filename: String) -> URL {
+        attachmentsDir.appendingPathComponent(filename)
+    }
+
     static func transcriptFile(for projectID: UUID) -> URL {
         sessionsDir.appendingPathComponent("\(projectID.uuidString).jsonl")
     }

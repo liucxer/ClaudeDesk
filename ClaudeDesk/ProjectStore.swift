@@ -6,9 +6,21 @@ import SwiftUI
 @MainActor
 final class ProjectStore: ObservableObject {
     @Published private(set) var projects: [Project] = []
-    @Published var selectedID: UUID?
+    /// Multi-select: empty = placeholder, 1 = single ChatView, 2+ = split view.
+    /// Sidebar's `List(selection:)` binds to this directly so cmd-click
+    /// toggles membership and a plain click replaces (standard macOS).
+    @Published var selectedIDs: Set<UUID> = [] {
+        didSet { saveUIState() }
+    }
+    /// Last-observed pane width per project, persisted across launches so the
+    /// split view restores its previous layout rather than always resetting to
+    /// equal halves.
+    @Published private(set) var paneWidths: [UUID: Double] = [:]
     @Published var isPresentingNewProjectPrompt: Bool = false
     @Published var lastError: String?
+
+    private static let kSelectedIDsKey = "ClaudeDesk.selectedIDs"
+    private static let kPaneWidthsKey  = "ClaudeDesk.paneWidths"
 
     private let prettyEncoder: JSONEncoder = {
         let e = JSONEncoder()
@@ -30,12 +42,79 @@ final class ProjectStore: ObservableObject {
 
     init() {
         load()
-        if selectedID == nil { selectedID = projects.first?.id }
+        loadUIState()
+        // Drop any persisted selection that points at a project that no longer
+        // exists (e.g., directory removed manually).
+        selectedIDs = selectedIDs.filter { id in projects.contains(where: { $0.id == id }) }
+        if selectedIDs.isEmpty, let first = projects.first?.id {
+            selectedIDs = [first]
+        }
     }
 
+    private func loadUIState() {
+        let ud = UserDefaults.standard
+        if let data = ud.data(forKey: Self.kSelectedIDsKey),
+           let arr = try? JSONDecoder().decode([UUID].self, from: data) {
+            // didSet here triggers a save back of identical data, which is fine.
+            selectedIDs = Set(arr)
+        }
+        if let data = ud.data(forKey: Self.kPaneWidthsKey) {
+            // Stored as [String: Double] (UUID isn't a JSON dict key).
+            if let dict = try? JSONDecoder().decode([String: Double].self, from: data) {
+                paneWidths = Dictionary(uniqueKeysWithValues:
+                    dict.compactMap { (k, v) -> (UUID, Double)? in
+                        UUID(uuidString: k).map { ($0, v) }
+                    }
+                )
+            }
+        }
+    }
+
+    private func saveUIState() {
+        let ud = UserDefaults.standard
+        if let data = try? JSONEncoder().encode(Array(selectedIDs)) {
+            ud.set(data, forKey: Self.kSelectedIDsKey)
+        }
+        let stringKeyed = Dictionary(uniqueKeysWithValues:
+            paneWidths.map { ($0.key.uuidString, $0.value) }
+        )
+        if let data = try? JSONEncoder().encode(stringKeyed) {
+            ud.set(data, forKey: Self.kPaneWidthsKey)
+        }
+    }
+
+    /// Called from ContentView's GeometryReader whenever a pane is resized
+    /// (either initially or by the user dragging the divider).
+    func recordPaneWidth(_ projectID: UUID, width: Double) {
+        // Coalesce sub-pixel chatter so we don't hammer UserDefaults during a
+        // drag — only persist when the change is meaningful.
+        if let prev = paneWidths[projectID], abs(prev - width) < 1 { return }
+        paneWidths[projectID] = width
+        saveUIState()
+    }
+
+    /// Bumped to force ContentView's HSplitView to rebuild with fresh idealWidths
+    /// after we wipe paneWidths. Without re-identifying the view, the underlying
+    /// NSSplitView keeps its current divider positions and ignores the change.
+    @Published private(set) var splitLayoutGeneration: Int = 0
+
+    /// Wipe saved widths for currently-selected projects and recycle the split
+    /// view so panes redistribute to equal widths.
+    func equalizeSelectedPaneWidths() {
+        for id in selectedIDs { paneWidths.removeValue(forKey: id) }
+        saveUIState()
+        splitLayoutGeneration &+= 1
+    }
+
+    /// Selected projects in sidebar order (so split-view panes are stable
+    /// regardless of click sequence).
+    var selectedProjects: [Project] {
+        projects.filter { selectedIDs.contains($0.id) }
+    }
+
+    /// Legacy single-selection accessor — first selected project, if any.
     var selectedProject: Project? {
-        guard let id = selectedID else { return nil }
-        return projects.first { $0.id == id }
+        selectedProjects.first
     }
 
     // MARK: - Persistence
@@ -100,7 +179,10 @@ final class ProjectStore: ObservableObject {
 
     func remove(_ id: UUID) {
         projects.removeAll { $0.id == id }
-        if selectedID == id { selectedID = projects.first?.id }
+        selectedIDs.remove(id)
+        if selectedIDs.isEmpty, let first = projects.first?.id {
+            selectedIDs = [first]
+        }
         save()
         try? FileManager.default.removeItem(at: AppPaths.transcriptFile(for: id))
     }
@@ -124,7 +206,7 @@ final class ProjectStore: ObservableObject {
         }
         let project = Project(name: name, directoryPath: dir.path)
         projects.append(project)
-        selectedID = project.id
+        selectedIDs = [project.id]
         save()
     }
 
@@ -141,7 +223,7 @@ final class ProjectStore: ObservableObject {
 
     func addExisting(directory url: URL) {
         if let existing = projects.first(where: { $0.directoryPath == url.path }) {
-            selectedID = existing.id
+            selectedIDs = [existing.id]
             return
         }
         let project = Project(
@@ -149,7 +231,7 @@ final class ProjectStore: ObservableObject {
             directoryPath: url.path
         )
         projects.append(project)
-        selectedID = project.id
+        selectedIDs = [project.id]
         save()
     }
 

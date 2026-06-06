@@ -13,7 +13,6 @@ struct PendingPermission: Identifiable {
     let toolName: String
     let inputDescription: String
     let rawInput: [String: Any]
-    fileprivate let responder: (PermissionDecision) -> Void
 }
 
 @MainActor
@@ -29,6 +28,12 @@ final class PermissionGateway: ObservableObject {
     private let listenQueue = DispatchQueue(label: "claudedesk.permission.listen")
     private let serverFD: Int32
 
+    // Responder lives outside `pending` so we can tell a clean resolve apart
+    // from SwiftUI clearing `pending` because the sheet was dismissed (Esc,
+    // window close, click-outside). The latter would leave the MCP socket
+    // handler waiting on its semaphore forever.
+    private var currentResponder: ((PermissionDecision) -> Void)?
+
     private init() {
         let randomToken = UUID().uuidString.prefix(12)
         let socketPath = "/tmp/claudedesk-\(randomToken).sock"
@@ -41,9 +46,21 @@ final class PermissionGateway: ObservableObject {
     }
 
     func resolve(_ decision: PermissionDecision) {
-        guard let p = pending else { return }
-        listenQueue.async { p.responder(decision) }
+        guard let r = currentResponder else { return }
+        currentResponder = nil
         pending = nil
+        listenQueue.async { r(decision) }
+    }
+
+    /// Called from `.sheet(onDismiss:)`. If the user dismissed the dialog
+    /// without clicking a button, auto-deny so the blocked MCP handler can
+    /// unwind. If they DID click a button, `resolve` has already cleared
+    /// `currentResponder` and this is a no-op.
+    func handleSheetDismiss() {
+        guard let r = currentResponder else { return }
+        currentResponder = nil
+        pending = nil
+        listenQueue.async { r(.deny(reason: "dialog dismissed without choice")) }
     }
 
     // MARK: - Relay script
@@ -116,32 +133,60 @@ final class PermissionGateway: ObservableObject {
         }
     }
 
-    nonisolated private func makeAsker() -> @Sendable (String, [String: Any], String) -> PermissionDecision {
-        return { [weak self] toolName, input, desc in
+    /// Producer signature accepts the client fd so the asker can monitor the
+    /// socket for peer hangup and unblock if claude dies mid-prompt.
+    nonisolated private func makeAsker() -> @Sendable (String, [String: Any], String, Int32) -> PermissionDecision {
+        return { [weak self] toolName, input, desc, fd in
             let sem = DispatchSemaphore(value: 0)
             let box = DecisionBox()
+
+            // Wake on peer hangup. If claude (or the bash relay) dies while
+            // we're waiting for the user, the socket gets EOF — bail with deny
+            // so the gateway state can recycle for the next turn.
+            let watcher = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .global())
+            watcher.setEventHandler {
+                var byte: UInt8 = 0
+                let n = Darwin.recv(fd, &byte, 1, MSG_PEEK)
+                if n <= 0 {
+                    box.set(.deny(reason: "client disconnected"))
+                    sem.signal()
+                }
+            }
+            watcher.resume()
+
             DispatchQueue.main.async {
                 guard let self else {
                     box.set(.deny(reason: "app exiting"))
                     sem.signal()
                     return
                 }
-                if self.pending != nil {
+                if self.currentResponder != nil {
                     box.set(.deny(reason: "another permission prompt is in progress"))
                     sem.signal()
                     return
                 }
+                self.currentResponder = { decision in
+                    box.set(decision)
+                    sem.signal()
+                }
                 self.pending = PendingPermission(
                     toolName: toolName,
                     inputDescription: desc,
-                    rawInput: input,
-                    responder: { decision in
-                        box.set(decision)
-                        sem.signal()
-                    }
+                    rawInput: input
                 )
             }
-            sem.wait()
+
+            // Hard timeout: if no decision arrives in 5 minutes (and the socket
+            // also hasn't dropped), bail anyway so a stuck dialog can never
+            // brick the gateway for the rest of the session.
+            let waitResult = sem.wait(timeout: .now() + 300)
+            watcher.cancel()
+            if waitResult == .timedOut, !box.wasSet {
+                box.set(.deny(reason: "permission prompt timed out"))
+                Task { @MainActor [weak self] in
+                    self?.handleSheetDismiss()
+                }
+            }
             return box.get()
         }
     }
@@ -150,7 +195,7 @@ final class PermissionGateway: ObservableObject {
 
     nonisolated private static func handleClient(
         fd: Int32,
-        ask: @escaping @Sendable (String, [String: Any], String) -> PermissionDecision
+        ask: @escaping @Sendable (String, [String: Any], String, Int32) -> PermissionDecision
     ) {
         var buffer = Data()
         var chunk = [UInt8](repeating: 0, count: 4096)
@@ -162,7 +207,7 @@ final class PermissionGateway: ObservableObject {
         guard let nl = buffer.firstIndex(of: 0x0A) else { Darwin.close(fd); return }
         let lineData = buffer.subdata(in: 0..<nl)
 
-        if let response = mcpHandle(lineData, ask: ask) {
+        if let response = mcpHandle(lineData, fd: fd, ask: ask) {
             var out = response
             out.append(0x0A)
             out.withUnsafeBytes { buf in
@@ -198,7 +243,8 @@ final class PermissionGateway: ObservableObject {
 
     nonisolated private static func mcpHandle(
         _ data: Data,
-        ask: @escaping @Sendable (String, [String: Any], String) -> PermissionDecision
+        fd: Int32,
+        ask: @escaping @Sendable (String, [String: Any], String, Int32) -> PermissionDecision
     ) -> Data? {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         // Notifications (no id) require no response.
@@ -238,7 +284,7 @@ final class PermissionGateway: ObservableObject {
             }
             let input = (args["input"] as? [String: Any]) ?? [:]
             let desc = describeInput(input)
-            let decision = ask(toolName, input, desc)
+            let decision = ask(toolName, input, desc, fd)
             let innerObj: [String: Any]
             switch decision {
             case .allow:
@@ -277,12 +323,22 @@ final class PermissionGateway: ObservableObject {
 private final class DecisionBox: @unchecked Sendable {
     private let lock = NSLock()
     nonisolated(unsafe) private var value: PermissionDecision = .deny(reason: "no response")
+    nonisolated(unsafe) private var _wasSet: Bool = false
     nonisolated init() {}
+    /// First setter wins. Late setters (e.g. a stale UI response that arrives
+    /// after a socket-EOF cancellation) are dropped.
     nonisolated func set(_ d: PermissionDecision) {
-        lock.lock(); value = d; lock.unlock()
+        lock.lock(); defer { lock.unlock() }
+        guard !_wasSet else { return }
+        value = d
+        _wasSet = true
     }
     nonisolated func get() -> PermissionDecision {
         lock.lock(); defer { lock.unlock() }
         return value
+    }
+    nonisolated var wasSet: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _wasSet
     }
 }
