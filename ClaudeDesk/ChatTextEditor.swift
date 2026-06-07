@@ -83,6 +83,18 @@ struct ChatTextEditor: NSViewRepresentable {
 final class PasteAwareTextView: NSTextView {
     var onImagesPasted: ([Data]) -> Void = { _ in }
 
+    /// Without this, NSTextView reports it only accepts text types (since
+    /// `isRichText = false`) — Cmd+V from a screenshot is dropped on the floor
+    /// before `paste(_:)` ever runs. Adding the image types here makes the
+    /// system actually dispatch the paste through to us.
+    override var readablePasteboardTypes: [NSPasteboard.PasteboardType] {
+        var types = super.readablePasteboardTypes
+        for extra in [.tiff, .png, .fileURL, NSPasteboard.PasteboardType("public.image")] {
+            if !types.contains(extra) { types.append(extra) }
+        }
+        return types
+    }
+
     override func paste(_ sender: Any?) {
         let pb = NSPasteboard.general
         if let datas = Self.readImageData(from: pb), !datas.isEmpty {
